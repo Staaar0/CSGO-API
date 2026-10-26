@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import * as esmFs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import path from 'node:path';
-import { auditLocalizationSources, discoverGenerators, discoverGroupInputs, generate, LOCALES, trackWrites } from './generate.mjs';
+import { auditLocalizationSources, discoverGenerators, discoverGroupInputs, generate, LOCALES, trackWrites, useSnapshots } from './generate.mjs';
 import { SUPPORTED_LOCALES, validateOutputs } from './validate.mjs';
 
 const runner = `
@@ -145,4 +147,179 @@ test('defaults to 27 locales without Thai and refuses invalid selected batches b
   const { source, output } = await generationFixture(t);
   await assert.rejects(generate({ source, output, languages: 'ru,unknown' }), /Unsupported language selection/);
   await assert.rejects(fsp.stat(output), { code: 'ENOENT' });
+});
+
+
+const FILE_RAW = 'https://raw.githubusercontent.com/ByMykel/counter-strike-file-tracker/main/static/';
+const IMAGE_RAW = 'https://raw.githubusercontent.com/ByMykel/counter-strike-image-tracker/refs/heads/main/static/';
+const MANIFEST_API = 'https://api.github.com/repos/ByMykel/counter-strike-file-tracker/contents/static/manifestId.txt';
+
+async function nativeSnapshotFixture(t) {
+  const fixture = await generationFixture(t);
+  const { source } = fixture;
+  const fileTracker = path.join(path.dirname(source), 'file-tracker');
+  const imageTracker = path.join(path.dirname(source), 'image-tracker');
+  await fsp.mkdir(path.join(fileTracker, 'static'), { recursive: true });
+  await fsp.mkdir(path.join(imageTracker, 'static'), { recursive: true });
+  for (const code of ['en', 'zh-CN', 'ru', 'fr']) {
+    await fsp.writeFile(path.join(fileTracker, 'static', `csgo_${code.replace('-', '_')}.json`),
+      JSON.stringify({ tag: code, lang: { Tokens: { example: `Official ${code}` } } }));
+  }
+  await fsp.writeFile(path.join(fileTracker, 'static/items_game.json'), '{"source":"pinned items"}');
+  await fsp.writeFile(path.join(fileTracker, 'static/manifestId.txt'), '1234567890123456789\n');
+  await fsp.writeFile(path.join(imageTracker, 'static/images.json'), '{"source":"pinned images"}');
+  await fsp.writeFile(path.join(imageTracker, 'static/default_generated.json'), '{"source":"pinned defaults"}');
+  await fsp.writeFile(path.join(source, 'constants.js'), `export const LANGUAGES_URL = ${JSON.stringify(SUPPORTED_LOCALES.map(code => ({ folder: code, language: code, url: `${FILE_RAW}csgo_${code.replace('-', '_')}.json` })))};`);
+  // Mirrors October 2026 upstream: native fetch, with no node_modules or Axios.
+  await fsp.writeFile(path.join(source, 'utils/http.js'), `export async function getJson(url) {const response = await fetch(url); if (!response.ok) throw new Error('Request failed: ' + response.status); return response.json();}`);
+  await fsp.writeFile(path.join(source, 'services/main.js'), `import {getJson} from '../utils/http.js'; export async function loadData() {
+    const items = await getJson(${JSON.stringify(`${FILE_RAW}items_game.json`)});
+    const images = await getJson(${JSON.stringify(`${IMAGE_RAW}images.json`)});
+    const defaults = await getJson(${JSON.stringify(`${IMAGE_RAW}default_generated.json`)});
+    if (items.source !== 'pinned items' || images.source !== 'pinned images' || defaults.source !== 'pinned defaults') throw new Error('Unpinned loader data');
+  }`);
+  await fsp.writeFile(path.join(source, 'services/translations.js'), `import {getJson} from '../utils/http.js'; import {setCode} from './state.js'; export async function loadTranslations(language) {const data = await getJson(language.url); if (data.tag !== language.folder) throw new Error('Wrong localization'); setCode(data.tag);}`);
+  return { ...fixture, fileTracker, imageTracker };
+}
+
+async function legacyAxiosFixture(source) {
+  const packageRoot = path.join(source, 'node_modules/axios');
+  await fsp.mkdir(packageRoot, { recursive: true });
+  await fsp.writeFile(path.join(packageRoot, 'package.json'), JSON.stringify({
+    name: 'axios', type: 'module', exports: { '.': './index.js', './package.json': './package.json' },
+  }));
+  // A tiny installed-package fixture exercises the documented Axios adapter
+  // boundary without downloading dependencies during tests.
+  await fsp.writeFile(path.join(packageRoot, 'index.js'), `const axios = {defaults: {adapter: async () => {throw new Error('Real HTTP forbidden');}}}; axios.get = async (url, options = {}) => {const response = await axios.defaults.adapter({...options, url, method: options.method || 'get'}); return {...response, data: JSON.parse(response.data)};}; export default axios;`);
+  return (await import(pathToFileURL(path.join(packageRoot, 'index.js')).href)).default;
+}
+
+test('native snapshot fetch returns real Responses from raw and API bytes without Axios', async t => {
+  const { source, fileTracker, imageTracker } = await nativeSnapshotFixture(t);
+  await assert.rejects(fsp.access(path.join(source, 'node_modules')), { code: 'ENOENT' });
+  const originalFetch = globalThis.fetch;
+  const snapshots = await useSnapshots(source, fileTracker, imageTracker);
+  try {
+    const response = await fetch(`${FILE_RAW}items_game.json`);
+    assert.equal(response instanceof Response, true);
+    assert.equal(response.ok, true);
+    assert.deepEqual(await response.clone().json(), { source: 'pinned items' });
+    assert.equal(await response.text(), '{"source":"pinned items"}');
+    assert.deepEqual(await (await fetch(new URL(`${IMAGE_RAW}images.json`))).json(), { source: 'pinned images' });
+    assert.deepEqual(await (await fetch(new Request(`${IMAGE_RAW}default_generated.json`))).json(), { source: 'pinned defaults' });
+    const payload = await (await fetch(`${MANIFEST_API}?ref=main`)).json();
+    const original = await fsp.readFile(path.join(fileTracker, 'static/manifestId.txt'));
+    assert.deepEqual(Buffer.from(payload.content, 'base64'), original);
+    assert.equal(payload.sha, createHash('sha1').update(Buffer.from(`blob ${original.length}\0`)).update(original).digest('hex'));
+    assert.equal(snapshots.files['counter-strike-file-tracker/static/manifestId.txt'], createHash('sha256').update(original).digest('hex'));
+    assert.deepEqual(Object.keys(snapshots.files).sort(), [
+      'counter-strike-file-tracker/static/items_game.json', 'counter-strike-file-tracker/static/manifestId.txt',
+      'counter-strike-image-tracker/static/default_generated.json', 'counter-strike-image-tracker/static/images.json',
+    ]);
+  } finally {
+    snapshots.restore();
+  }
+  assert.equal(globalThis.fetch, originalFetch);
+});
+
+test('snapshot fetch applies Request method overrides and blocks unpinned network requests', async t => {
+  const { source, fileTracker, imageTracker } = await nativeSnapshotFixture(t);
+  const originalFetch = globalThis.fetch;
+  let networkCalls = 0;
+  const forbiddenNetwork = async () => {networkCalls += 1; throw new Error('Unexpected real network');};
+  globalThis.fetch = forbiddenNetwork;
+  let snapshots;
+  try {
+    snapshots = await useSnapshots(source, fileTracker, imageTracker);
+    const postRequest = new Request(`${FILE_RAW}items_game.json`, { method: 'POST' });
+    assert.deepEqual(await (await fetch(postRequest, { method: 'GET' })).json(), { source: 'pinned items' });
+    await assert.rejects(fetch(new Request(`${FILE_RAW}items_game.json`), { method: 'POST' }), /Unsupported upstream HTTP method/);
+    await assert.rejects(fetch(new Request(`${FILE_RAW}items_game.json`, { method: 'HEAD' })), /Unsupported upstream HTTP method/);
+    for (const url of [
+      'https://example.test/items_game.json',
+      'http://raw.githubusercontent.com/ByMykel/counter-strike-file-tracker/main/static/items_game.json',
+      'https://raw.githubusercontent.com:8443/ByMykel/counter-strike-file-tracker/main/static/items_game.json',
+      'https://raw.githubusercontent.com/other/counter-strike-file-tracker/main/static/items_game.json',
+      'https://api.github.com/repos/ByMykel/another-repository/contents/static/images.json',
+      `${FILE_RAW}nested/items_game.json`,
+    ]) await assert.rejects(fetch(url), /Unexpected network destination|Unsupported upstream/);
+    const aborted = AbortSignal.abort(new Error('Cancelled snapshot read'));
+    await assert.rejects(fetch(`${FILE_RAW}items_game.json`, { signal: aborted }), /Cancelled snapshot read/);
+    await assert.rejects(fetch(`${FILE_RAW}missing.json`), { code: 'ENOENT' });
+    assert.equal(networkCalls, 0);
+  } finally {
+    snapshots?.restore();
+    assert.equal(globalThis.fetch, forbiddenNetwork);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('generates a pinned native-fetch upstream with no Axios and restores fetch on success', async t => {
+  const fixture = await nativeSnapshotFixture(t);
+  const originalFetch = globalThis.fetch;
+  const forbiddenNetwork = async () => {throw new Error('Unexpected real network');};
+  globalThis.fetch = forbiddenNetwork;
+  try {
+    const report = await generate({ ...fixture, languages: 'ru,fr' });
+    assert.equal(globalThis.fetch, forbiddenNetwork);
+    assert.equal(report.inputMode, 'pinned-local-snapshots');
+    assert.deepEqual(report.generated, ['ru', 'fr']);
+    assert.equal(Object.keys(report.inputFileSha256).length, 5);
+    assert.deepEqual(report.localizationSources.locales.ru.missingKeySample, []);
+    for (const code of ['en', 'zh-CN']) {
+      assert.deepEqual(await fsp.readFile(path.join(fixture.output, 'api', code, 'all.json')),
+        await fsp.readFile(path.join(fixture.source, 'public/api', code, 'all.json')));
+    }
+    assert.equal((await validateOutputs(path.join(fixture.output, 'api'), fixture.source, { locales: ['ru', 'fr'] })).locales, 4);
+    await assert.rejects(fsp.access(path.join(fixture.source, 'node_modules')), { code: 'ENOENT' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('bridges an existing legacy Axios adapter alongside native fetch and restores both', async t => {
+  const { source, fileTracker, imageTracker } = await nativeSnapshotFixture(t);
+  const axios = await legacyAxiosFixture(source);
+  const originalAdapter = axios.defaults.adapter;
+  const originalFetch = globalThis.fetch;
+  const snapshots = await useSnapshots(source, fileTracker, imageTracker);
+  try {
+    assert.notEqual(axios.defaults.adapter, originalAdapter);
+    assert.deepEqual((await axios.get(`${FILE_RAW}items_game.json`)).data, { source: 'pinned items' });
+    const payload = (await axios.get(MANIFEST_API)).data;
+    assert.equal(Buffer.from(payload.content, 'base64').toString('utf8'), '1234567890123456789\n');
+    assert.deepEqual(await (await fetch(`${IMAGE_RAW}images.json`)).json(), { source: 'pinned images' });
+    await assert.rejects(axios.get('https://example.test/blocked'), /Unexpected network destination/);
+    await assert.rejects(axios.get(`${FILE_RAW}items_game.json`, { method: 'POST' }), /Unsupported upstream HTTP method/);
+  } finally {
+    snapshots.restore();
+  }
+  assert.equal(axios.defaults.adapter, originalAdapter);
+  assert.equal(globalThis.fetch, originalFetch);
+});
+
+test('restores native fetch, installed Axios, writes, and cwd after an upstream loader failure', async t => {
+  const fixture = await nativeSnapshotFixture(t);
+  const axios = await legacyAxiosFixture(fixture.source);
+  const originalAdapter = axios.defaults.adapter;
+  const originalFetch = globalThis.fetch;
+  const originalWrite = esmFs.writeFile;
+  const originalCwd = process.cwd();
+  await fsp.writeFile(path.join(fixture.source, 'services/main.js'), `export async function loadData() {await fetch('https://example.test/unpinned');}`);
+  await assert.rejects(generate({ ...fixture, languages: 'ru' }), /Unexpected network destination/);
+  assert.equal(globalThis.fetch, originalFetch);
+  assert.equal(axios.defaults.adapter, originalAdapter);
+  assert.equal(esmFs.writeFile, originalWrite);
+  assert.equal(process.cwd(), originalCwd);
+});
+
+test('does not hide a broken installed Axios package or leave fetch overridden', async t => {
+  const { source, fileTracker, imageTracker } = await nativeSnapshotFixture(t);
+  const packageRoot = path.join(source, 'node_modules/axios');
+  await fsp.mkdir(packageRoot, { recursive: true });
+  await fsp.writeFile(path.join(packageRoot, 'package.json'), JSON.stringify({ name: 'axios', type: 'module' }));
+  // Resolution succeeds, but loading the installed package's missing index fails.
+  const originalFetch = globalThis.fetch;
+  await assert.rejects(useSnapshots(source, fileTracker, imageTracker), /ENOENT|Cannot find module/);
+  assert.equal(globalThis.fetch, originalFetch);
 });

@@ -155,18 +155,35 @@ export async function auditLocalizationSources(fileTracker, languages) {
   };
 }
 
-/** Replace only axios transport, leaving upstream parsers and TLS defaults intact. */
-async function useSnapshots(source, fileTracker, imageTracker) {
+/** Serve pinned bytes to upstream's native fetch and optional legacy Axios. */
+export async function useSnapshots(source, fileTracker, imageTracker) {
   if (!fileTracker && !imageTracker) return { mode: 'upstream-network', files: {}, restore() {} };
   assert(fileTracker && imageTracker, 'Provide both --file-tracker and --image-tracker');
+  assert(typeof globalThis.fetch === 'function' && typeof Request === 'function' && typeof Response === 'function',
+    'Pinned snapshots require a Node runtime with native fetch, Request, and Response');
+
+  // New upstream versions have no Axios dependency. Reuse it only when the
+  // selected upstream actually has it; never add or install a removed package.
   const requireFromSource = createRequire(path.join(source, 'package.json'));
-  const packageFile = requireFromSource.resolve('axios/package.json');
-  const { default: axios } = await import(pathToFileURL(path.join(path.dirname(packageFile), 'index.js')).href);
-  const originalAdapter = axios.defaults.adapter;
+  let packageFile;
+  try {
+    packageFile = requireFromSource.resolve('axios/package.json');
+  } catch (error) {
+    if (error.code !== 'MODULE_NOT_FOUND') throw error;
+  }
+  let axios;
+  if (packageFile) {
+    ({ default: axios } = await import(pathToFileURL(path.join(path.dirname(packageFile), 'index.js')).href));
+    assert(axios?.defaults && typeof axios.defaults === 'object', 'Unsupported installed Axios defaults');
+  }
+
+  const originalFetch = globalThis.fetch;
+  const originalAdapter = axios?.defaults.adapter;
   const files = {};
-  axios.defaults.adapter = async config => {
-    const url = new URL(config.url, config.baseURL);
-    assert((config.method || 'get').toLowerCase() === 'get', `Unsupported upstream HTTP method for ${url}`);
+  const readSnapshot = async (url, method) => {
+    assert(method.toLowerCase() === 'get', `Unsupported upstream HTTP method for ${url}`);
+    assert(url.protocol === 'https:' && !url.username && !url.password && !url.port,
+      `Unsupported upstream URL origin in snapshot mode: ${url}`);
     let repo;
     let relative;
     let api = false;
@@ -183,13 +200,37 @@ async function useSnapshots(source, fileTracker, imageTracker) {
     const root = repo === 'counter-strike-file-tracker' ? fileTracker : imageTracker;
     const bytes = await fsp.readFile(path.join(root, relative));
     files[`${repo}/${relative}`] = createHash('sha256').update(bytes).digest('hex');
-    const data = api ? JSON.stringify({
+    return api ? Buffer.from(JSON.stringify({
       content: bytes.toString('base64'),
       sha: createHash('sha1').update(Buffer.from(`blob ${bytes.length}\0`)).update(bytes).digest('hex'),
-    }) : bytes.toString('utf8');
-    return { data, status: 200, statusText: 'OK', headers: { 'content-type': 'application/json' }, config, request: { localSnapshot: true } };
+    })) : bytes;
   };
-  return { mode: 'pinned-local-snapshots', files, restore() { axios.defaults.adapter = originalAdapter; } };
+  const snapshotFetch = async (input, init) => {
+    // Request applies normal fetch semantics, including init.method overriding
+    // the method in a supplied Request. It also accepts strings and URL objects.
+    const request = new Request(input, init);
+    request.signal.throwIfAborted();
+    const bytes = await readSnapshot(new URL(request.url), request.method);
+    request.signal.throwIfAborted();
+    return new Response(bytes, { status: 200, statusText: 'OK', headers: { 'content-type': 'application/json' } });
+  };
+  const snapshotAdapter = async config => {
+    const url = new URL(config.url, config.baseURL);
+    const bytes = await readSnapshot(url, config.method || 'get');
+    return { data: bytes.toString('utf8'), status: 200, statusText: 'OK', headers: { 'content-type': 'application/json' }, config, request: { localSnapshot: true } };
+  };
+  const restore = () => {
+    globalThis.fetch = originalFetch;
+    if (axios) axios.defaults.adapter = originalAdapter;
+  };
+  try {
+    globalThis.fetch = snapshotFetch;
+    if (axios) axios.defaults.adapter = snapshotAdapter;
+  } catch (error) {
+    restore();
+    throw error;
+  }
+  return { mode: 'pinned-local-snapshots', files, restore };
 }
 
 async function buildAll(directory, inputFiles) {
@@ -250,13 +291,14 @@ export async function generate({ source, output, fileTracker, imageTracker, lang
     return matches[0];
   });
   const localizationSources = await auditLocalizationSources(fileTracker, languages);
-  const transport = await useSnapshots(source, fileTracker, imageTracker);
   const originalCwd = process.cwd();
   const generated = [];
   const api = path.join(output, 'api');
   await fsp.mkdir(api);
   let writes;
+  let transport;
   try {
+    transport = await useSnapshots(source, fileTracker, imageTracker);
     process.chdir(source);
     const { loadData } = await import(pathToFileURL(path.join(source, 'services/main.js')).href);
     const { loadTranslations } = await import(pathToFileURL(path.join(source, 'services/translations.js')).href);
@@ -322,7 +364,7 @@ export async function generate({ source, output, fileTracker, imageTracker, lang
     return report;
   } finally {
     if (writes) writes.restore();
-    transport.restore();
+    transport?.restore();
     process.chdir(originalCwd);
   }
 }
