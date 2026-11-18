@@ -1,11 +1,11 @@
 {
   "status": "validated",
   "sources": {
-    "upstream": "d0397e2416a83c4d8592b615eff98e62bc5b96c6",
+    "upstream": "ea5456ff0f9cac8db3d60e3a91a652ff5944128e",
     "file-tracker": "f43be4f64fb64c253c6619d35bfbbc94d2e14951",
-    "image-tracker": "a546cdae73cb4498385c2f8ffc4b00aa1725ca78"
+    "image-tracker": "b28d0c094837da72de5c181bf8ed443bf6876c18"
   },
-  "dataset_sha256": "369b3b337a1191cb4a8d57f100115bce0f498ad07842771880a2783efdb15599",
+  "dataset_sha256": "82d321713288038096a9d0e347a4a2e27b32dcc42244c7b37a940275aba408c2",
   "locales": [
     "en",
     "zh-CN",
@@ -156,9 +156,9 @@
     {
       "locale": "bg",
       "file": "all.json.gz",
-      "uncompressed_sha256": "7ca48365e87312868f28f5d51c1e330552800fd8fd982b15f735c392be9ce075",
-      "uncompressed_bytes": 106194206,
-      "compressed_bytes": 6039824
+      "uncompressed_sha256": "e580777700cdf4dcfe63e56011d678cc2b89a2e62da496537a6c3f988a062b95",
+      "uncompressed_bytes": 108900586,
+      "compressed_bytes": 6088206
     }
   ],
   "spelling_certified": false
