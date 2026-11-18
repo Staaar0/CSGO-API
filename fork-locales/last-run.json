@@ -1,11 +1,11 @@
 {
   "status": "validated",
   "sources": {
-    "upstream": "48278886b6ff24e4ab64d09705e6b37e300f45d1",
-    "file-tracker": "60b915fd633fd637edaf804d445ba63c8a9138b8",
-    "image-tracker": "4fb140467b09d384120c009974ad81f1ffbbef4f"
+    "upstream": "d0397e2416a83c4d8592b615eff98e62bc5b96c6",
+    "file-tracker": "f43be4f64fb64c253c6619d35bfbbc94d2e14951",
+    "image-tracker": "a546cdae73cb4498385c2f8ffc4b00aa1725ca78"
   },
-  "dataset_sha256": "feaf04de223cca628dd00427dcb6939d2814c7ddb3668e1da90f49d9553137df",
+  "dataset_sha256": "369b3b337a1191cb4a8d57f100115bce0f498ad07842771880a2783efdb15599",
   "locales": [
     "en",
     "zh-CN",
@@ -152,6 +152,14 @@
       "status": "validated"
     }
   ],
-  "compressed_combined_files": [],
+  "compressed_combined_files": [
+    {
+      "locale": "bg",
+      "file": "all.json.gz",
+      "uncompressed_sha256": "7ca48365e87312868f28f5d51c1e330552800fd8fd982b15f735c392be9ce075",
+      "uncompressed_bytes": 106194206,
+      "compressed_bytes": 6039824
+    }
+  ],
   "spelling_certified": false
 }
